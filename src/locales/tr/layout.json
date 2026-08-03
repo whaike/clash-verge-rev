@@ -6,6 +6,7 @@
         "proxies": "Vekil'ler",
         "profiles": "Profiller",
         "connections": "Bağlantılar",
+        "appRouting": "App Routing",
         "rules": "Kurallar",
         "logs": "Günlükler",
         "unlock": "Test",

@@ -6,6 +6,7 @@
         "proxies": "Прокси",
         "profiles": "Профили",
         "connections": "Соединения",
+        "appRouting": "App Routing",
         "rules": "Правила",
         "logs": "Логи",
         "unlock": "Тест",

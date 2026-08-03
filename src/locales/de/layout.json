@@ -6,6 +6,7 @@
         "proxies": "Proxy",
         "profiles": "Abonnement",
         "connections": "Verbindungen",
+        "appRouting": "App Routing",
         "rules": "Regeln",
         "logs": "Protokolle",
         "unlock": "Testen",

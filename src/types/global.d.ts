@@ -276,6 +276,47 @@ interface IVergeTestItem {
   icon?: string
   url: string
 }
+
+type IAppRoutingMatcher =
+  | 'process-name'
+  | 'process-path'
+  | 'process-name-regex'
+  | 'process-path-regex'
+
+type IAppRoutingSource = 'manual' | 'connection' | 'preset' | 'analyzer'
+
+interface IAppProcessSuggestion {
+  name: string
+  path: string
+}
+
+interface IAppRoutingRule {
+  uid: string
+  name?: string
+  enabled?: boolean
+  matcher: IAppRoutingMatcher
+  value: string
+  policy: string
+  address_policy?: 'all-proxy' | 'cn-direct'
+  source?: IAppRoutingSource | string
+}
+
+interface IAppRoutingRestore {
+  clash_mode?: string
+  enable_tun_mode?: boolean
+  enable_system_proxy?: boolean
+}
+
+interface IAppRoutingConfig {
+  enabled?: boolean
+  restore?: IAppRoutingRestore
+  process_mode?: 'always' | 'strict' | 'off'
+  smart_rules_enabled?: boolean
+  smart_proxy_policy?: string
+  smart_direct_policy?: string
+  smart_reject_ads?: boolean
+  rules?: IAppRoutingRule[]
+}
 interface IAddress {
   V4?: {
     ip: string
@@ -894,6 +935,7 @@ interface IVergeConfig {
   tray_proxy_groups_display_mode?: 'default' | 'inline' | 'disable'
   tray_inline_outbound_modes?: boolean
   enable_tun_mode?: boolean
+  app_routing?: IAppRoutingConfig
   enable_auto_light_weight_mode?: boolean
   auto_light_weight_minutes?: number
   enable_auto_launch?: boolean

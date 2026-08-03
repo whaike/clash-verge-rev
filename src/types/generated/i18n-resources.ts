@@ -204,6 +204,7 @@ export interface TranslationResources {
             unlock: string
           }
           tabs: {
+            appRouting: string
             connections: string
             home: string
             logs: string

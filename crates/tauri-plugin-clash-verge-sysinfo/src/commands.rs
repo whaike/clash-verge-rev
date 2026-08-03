@@ -1,5 +1,6 @@
 use parking_lot::RwLock;
 use serde::Serialize;
+use sysinfo::{ProcessesToUpdate, System};
 use tauri::{AppHandle, Runtime, State, command};
 use tauri_plugin_clipboard_manager::{ClipboardExt as _, Error};
 
@@ -14,6 +15,13 @@ pub struct SystemInfo {
     pub app_version: String,
     pub app_core_mode: String,
     pub app_is_admin: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessSuggestion {
+    pub name: String,
+    pub path: String,
 }
 
 impl From<Platform> for SystemInfo {
@@ -46,6 +54,38 @@ pub fn get_app_uptime(state: State<'_, RwLock<Platform>>) -> Result<u128, Error>
 #[command]
 pub fn app_is_admin(state: State<'_, RwLock<Platform>>) -> Result<bool, Error> {
     Ok(state.inner().read().appinfo.app_is_admin)
+}
+
+/// Returns running processes whose executable name or path matches the user's
+/// query. This is deliberately local-only; it neither launches nor restarts a
+/// target application.
+#[command]
+pub fn find_running_processes(query: String) -> Result<Vec<ProcessSuggestion>, Error> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut system = System::new_all();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+
+    let mut processes = system
+        .processes()
+        .values()
+        .filter_map(|process| {
+            let name = process.name().to_string_lossy().into_owned();
+            let path = process
+                .exe()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let matches = name.to_lowercase().contains(&query) || path.to_lowercase().contains(&query);
+            matches.then_some(ProcessSuggestion { name, path })
+        })
+        .collect::<Vec<_>>();
+
+    processes.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
+    processes.dedup_by(|left, right| left.name == right.name && left.path == right.path);
+    Ok(processes)
 }
 
 #[command]

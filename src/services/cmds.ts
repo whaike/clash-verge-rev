@@ -160,6 +160,10 @@ export async function getVergeConfig() {
   return invoke<IVergeConfig>('get_verge_config')
 }
 
+export async function findRunningProcesses(query: string) {
+  return invoke<IAppProcessSuggestion[]>('find_running_processes', { query })
+}
+
 export async function patchVergeConfig(payload: IVergeConfig) {
   return invoke<void>('patch_verge_config', { payload })
 }

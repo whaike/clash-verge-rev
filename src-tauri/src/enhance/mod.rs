@@ -15,13 +15,13 @@ use self::{
 };
 use crate::utils::dirs;
 use crate::{
-    config::{Config, IVerge, PrfItem},
+    config::{Config, IAppRouting, IAppRoutingRule, IVerge, PrfItem},
     constants,
     utils::tmpl,
 };
 use anyhow::{Context as _, Result};
 use clash_verge_logging::{Type, logging};
-use serde_yaml_ng::{Mapping, Value};
+use serde_yaml_ng::{Mapping, Sequence, Value};
 use smartstring::alias::String;
 use std::collections::{HashMap, HashSet};
 use tokio::fs;
@@ -37,6 +37,7 @@ struct ConfigValues {
     http_enabled: bool,
     enable_dns_settings: bool,
     enable_external_controller: bool,
+    app_routing: Option<IAppRouting>,
     #[cfg(not(target_os = "windows"))]
     redir_enabled: bool,
     #[cfg(target_os = "linux")]
@@ -118,6 +119,7 @@ async fn get_config_values() -> ConfigValues {
         ref verge_http_enabled,
         ref enable_dns_settings,
         ref enable_external_controller,
+        ref app_routing,
         ..
     } = **verge_arc;
     let enable_external_controller = enable_external_controller.unwrap_or(false);
@@ -130,6 +132,7 @@ async fn get_config_values() -> ConfigValues {
         verge_http_enabled.unwrap_or(false),
         enable_dns_settings.unwrap_or(false),
     );
+    let app_routing = app_routing.clone();
 
     #[cfg(not(target_os = "windows"))]
     let redir_enabled = verge_arc.verge_redir_enabled.unwrap_or(false);
@@ -149,6 +152,7 @@ async fn get_config_values() -> ConfigValues {
         http_enabled,
         enable_dns_settings,
         enable_external_controller,
+        app_routing,
         #[cfg(not(target_os = "windows"))]
         redir_enabled,
         #[cfg(target_os = "linux")]
@@ -711,6 +715,366 @@ async fn apply_dns_settings(mut config: Mapping, enable_dns_settings: bool) -> M
     config
 }
 
+fn normalize_app_routing_matcher(matcher: Option<&str>) -> &'static str {
+    match matcher.unwrap_or("process-name").trim().to_ascii_lowercase().as_str() {
+        "process-path" => "PROCESS-PATH",
+        "process-name-regex" => "PROCESS-NAME-REGEX",
+        "process-path-regex" => "PROCESS-PATH-REGEX",
+        _ => "PROCESS-NAME",
+    }
+}
+
+fn normalize_app_routing_process_mode(process_mode: Option<&str>) -> &'static str {
+    match process_mode.unwrap_or("always").trim().to_ascii_lowercase().as_str() {
+        "strict" => "strict",
+        "off" => "off",
+        _ => "always",
+    }
+}
+
+fn app_routing_rule_to_yaml(rule: &IAppRoutingRule) -> Option<Value> {
+    if !rule.enabled.unwrap_or(true) {
+        return None;
+    }
+
+    let value = rule.value.as_deref()?.trim();
+    let policy = rule.policy.as_deref()?.trim();
+
+    if value.is_empty() || policy.is_empty() {
+        return None;
+    }
+
+    let matcher = normalize_app_routing_matcher(rule.matcher.as_deref());
+    Some(Value::from(format!("{matcher},{value},{policy}")))
+}
+
+fn app_routing_address_rules_to_yaml(rule: &IAppRoutingRule) -> Sequence {
+    if !rule.enabled.unwrap_or(true) || !matches!(rule.address_policy.as_deref(), Some("cn-direct")) {
+        return Sequence::new();
+    }
+
+    let Some(value) = rule.value.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+        return Sequence::new();
+    };
+    let matcher = normalize_app_routing_matcher(rule.matcher.as_deref());
+
+    // Mihomo logical rules accept nested rule payloads. These must precede the
+    // app's terminal policy so they only affect the selected application.
+    Sequence::from(vec![
+        Value::from(format!("AND,(({matcher},{value}),(GEOSITE,cn)),DIRECT")),
+        Value::from(format!("AND,(({matcher},{value}),(GEOIP,CN)),DIRECT")),
+    ])
+}
+
+fn app_routing_smart_rules_to_yaml(app_routing: &IAppRouting) -> Sequence {
+    if !app_routing.smart_rules_enabled.unwrap_or(false) {
+        return Sequence::new();
+    }
+
+    let direct_policy = app_routing
+        .smart_direct_policy
+        .as_deref()
+        .map(str::trim)
+        .filter(|policy| !policy.is_empty())
+        .unwrap_or("DIRECT");
+
+    let proxy_policy = app_routing
+        .smart_proxy_policy
+        .as_deref()
+        .map(str::trim)
+        .filter(|policy| !policy.is_empty());
+
+    let mut rules = Sequence::new();
+    if app_routing.smart_reject_ads.unwrap_or(true) {
+        rules.push(Value::from("GEOSITE,category-ads-all,REJECT"));
+    }
+
+    rules.push(Value::from(format!("GEOIP,private,{direct_policy},no-resolve")));
+    rules.push(Value::from(format!("GEOSITE,cn,{direct_policy}")));
+    rules.push(Value::from(format!("GEOIP,CN,{direct_policy},no-resolve")));
+
+    if let Some(proxy_policy) = proxy_policy {
+        rules.push(Value::from(format!("GEOSITE,geolocation-!cn,{proxy_policy}")));
+    }
+
+    rules
+}
+
+fn apply_app_routing_dns_compatibility(config: &mut Mapping) {
+    let Some(dns) = config.get_mut("dns").and_then(Value::as_mapping_mut) else {
+        return;
+    };
+    if dns.get("enhanced-mode").and_then(Value::as_str) == Some("fake-ip") {
+        // Selected-app routing prioritizes real DNS answers for broad application compatibility.
+        dns.insert(Value::from("enhanced-mode"), Value::from("redir-host"));
+    }
+}
+
+fn apply_app_routing_rules(mut config: Mapping, app_routing: Option<IAppRouting>) -> (Mapping, bool) {
+    let Some(app_routing) = app_routing else {
+        return (config, false);
+    };
+
+    if !app_routing.enabled.unwrap_or(false) {
+        return (config, false);
+    }
+
+    let app_rules = app_routing.rules.as_deref().unwrap_or(&[]);
+    let mut generated_rules = app_rules
+        .iter()
+        .flat_map(app_routing_address_rules_to_yaml)
+        .collect::<Sequence>();
+    generated_rules.extend(app_rules.iter().filter_map(app_routing_rule_to_yaml));
+    generated_rules.extend(app_routing_smart_rules_to_yaml(&app_routing));
+
+    // Stop before subscription rules. Otherwise an unselected proxy-aware app
+    // (for example Chrome) can still match the profile's Google rules.
+    generated_rules.push(Value::from("MATCH,DIRECT"));
+
+    let mut rules = generated_rules;
+    if let Some(Value::Sequence(existing_rules)) = config.remove("rules") {
+        rules.extend(existing_rules);
+    }
+
+    config.insert(Value::from("rules"), Value::Sequence(rules));
+    config.insert(
+        Value::from("find-process-mode"),
+        Value::from(normalize_app_routing_process_mode(app_routing.process_mode.as_deref())),
+    );
+    apply_app_routing_dns_compatibility(&mut config);
+
+    (config, true)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, reason = "tests assert by panicking")]
+mod app_routing_tests {
+    use super::{IAppRouting, IAppRoutingRule, Value, apply_app_routing_rules};
+    use serde_yaml_ng::Mapping;
+
+    fn routing(rules: Vec<IAppRoutingRule>) -> IAppRouting {
+        IAppRouting {
+            enabled: Some(true),
+            restore: None,
+            process_mode: Some("always".into()),
+            smart_rules_enabled: None,
+            smart_proxy_policy: None,
+            smart_direct_policy: None,
+            smart_reject_ads: None,
+            rules: Some(rules),
+        }
+    }
+
+    #[test]
+    fn app_routing_prepends_enabled_process_rules() {
+        let mut config = Mapping::new();
+        config.insert(Value::from("rules"), Value::Sequence(vec![Value::from("MATCH,DIRECT")]));
+
+        let (config, applied) = apply_app_routing_rules(
+            config,
+            Some(routing(vec![IAppRoutingRule {
+                enabled: Some(true),
+                matcher: Some("process-name".into()),
+                value: Some("Cursor".into()),
+                policy: Some("DIRECT".into()),
+                ..IAppRoutingRule::default()
+            }])),
+        );
+
+        assert!(applied);
+        assert_eq!(config.get("find-process-mode").and_then(Value::as_str), Some("always"));
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_sequence)
+            .expect("rules should be a sequence");
+        assert_eq!(
+            rules.first().and_then(Value::as_str),
+            Some("PROCESS-NAME,Cursor,DIRECT")
+        );
+        assert_eq!(rules.get(1).and_then(Value::as_str), Some("MATCH,DIRECT"));
+        assert_eq!(rules.get(2).and_then(Value::as_str), Some("MATCH,DIRECT"));
+    }
+
+    #[test]
+    fn app_routing_skips_disabled_or_incomplete_rules() {
+        let config = Mapping::new();
+        let (config, applied) = apply_app_routing_rules(
+            config,
+            Some(routing(vec![
+                IAppRoutingRule {
+                    enabled: Some(false),
+                    matcher: Some("process-name".into()),
+                    value: Some("Cursor".into()),
+                    policy: Some("DIRECT".into()),
+                    ..IAppRoutingRule::default()
+                },
+                IAppRoutingRule {
+                    enabled: Some(true),
+                    matcher: Some("process-name".into()),
+                    value: Some("".into()),
+                    policy: Some("DIRECT".into()),
+                    ..IAppRoutingRule::default()
+                },
+            ])),
+        );
+
+        assert!(applied);
+        assert_eq!(
+            config
+                .get("rules")
+                .and_then(Value::as_sequence)
+                .and_then(|rules| rules.first())
+                .and_then(Value::as_str),
+            Some("MATCH,DIRECT")
+        );
+    }
+
+    #[test]
+    fn disabled_app_routing_leaves_the_original_config_untouched() {
+        let mut config = Mapping::new();
+        config.insert(Value::from("mode"), Value::from("global"));
+        config.insert(Value::from("rules"), Value::Sequence(vec![Value::from("MATCH,Proxy")]));
+        let mut app_routing = routing(Vec::new());
+        app_routing.enabled = Some(false);
+
+        let (config, applied) = apply_app_routing_rules(config, Some(app_routing));
+
+        assert!(!applied);
+        assert_eq!(config.get("mode").and_then(Value::as_str), Some("global"));
+        assert_eq!(
+            config
+                .get("rules")
+                .and_then(Value::as_sequence)
+                .and_then(|rules| rules.first())
+                .and_then(Value::as_str),
+            Some("MATCH,Proxy")
+        );
+        assert!(config.get("find-process-mode").is_none());
+    }
+
+    #[test]
+    fn app_routing_adds_optional_smart_rules_after_process_rules() {
+        let mut config = Mapping::new();
+        config.insert(Value::from("rules"), Value::Sequence(vec![Value::from("MATCH,Proxy")]));
+
+        let mut app_routing = routing(vec![IAppRoutingRule {
+            enabled: Some(true),
+            matcher: Some("process-name".into()),
+            value: Some("Microsoft Edge Helper".into()),
+            policy: Some("Proxy".into()),
+            ..IAppRoutingRule::default()
+        }]);
+        app_routing.smart_rules_enabled = Some(true);
+        app_routing.smart_proxy_policy = Some("Proxy".into());
+        app_routing.smart_direct_policy = Some("DIRECT".into());
+        app_routing.smart_reject_ads = Some(true);
+
+        let (config, applied) = apply_app_routing_rules(config, Some(app_routing));
+
+        assert!(applied);
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_sequence)
+            .expect("rules should be a sequence");
+
+        assert_eq!(
+            rules.first().and_then(Value::as_str),
+            Some("PROCESS-NAME,Microsoft Edge Helper,Proxy")
+        );
+        assert_eq!(
+            rules.get(1).and_then(Value::as_str),
+            Some("GEOSITE,category-ads-all,REJECT")
+        );
+        assert_eq!(
+            rules.get(5).and_then(Value::as_str),
+            Some("GEOSITE,geolocation-!cn,Proxy")
+        );
+        assert_eq!(rules.get(6).and_then(Value::as_str), Some("MATCH,DIRECT"));
+        assert_eq!(rules.get(7).and_then(Value::as_str), Some("MATCH,Proxy"));
+    }
+
+    #[test]
+    fn app_routing_can_keep_cn_destinations_direct_for_one_application() {
+        let app_routing = routing(vec![IAppRoutingRule {
+            enabled: Some(true),
+            matcher: Some("process-name".into()),
+            value: Some("Microsoft Edge Helper".into()),
+            policy: Some("Proxy".into()),
+            address_policy: Some("cn-direct".into()),
+            ..IAppRoutingRule::default()
+        }]);
+
+        let (config, _) = apply_app_routing_rules(Mapping::new(), Some(app_routing));
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_sequence)
+            .expect("rules should exist");
+        assert_eq!(
+            rules.first().and_then(Value::as_str),
+            Some("AND,((PROCESS-NAME,Microsoft Edge Helper),(GEOSITE,cn)),DIRECT")
+        );
+        assert_eq!(
+            rules.get(1).and_then(Value::as_str),
+            Some("AND,((PROCESS-NAME,Microsoft Edge Helper),(GEOIP,CN)),DIRECT")
+        );
+        assert_eq!(
+            rules.get(2).and_then(Value::as_str),
+            Some("PROCESS-NAME,Microsoft Edge Helper,Proxy")
+        );
+        assert_eq!(rules.get(3).and_then(Value::as_str), Some("MATCH,DIRECT"));
+    }
+
+    #[test]
+    fn app_routing_uses_real_dns_when_the_profile_uses_fake_ip() {
+        let mut dns = Mapping::new();
+        dns.insert(Value::from("enhanced-mode"), Value::from("fake-ip"));
+        let mut config = Mapping::new();
+        config.insert(Value::from("dns"), Value::Mapping(dns));
+        let app_rule = IAppRoutingRule {
+            enabled: Some(true),
+            matcher: Some("process-path".into()),
+            value: Some("/Applications/Example.app/Contents/MacOS/Example".into()),
+            policy: Some("Proxy".into()),
+            ..IAppRoutingRule::default()
+        };
+
+        let (config, _) = apply_app_routing_rules(config, Some(routing(vec![app_rule])));
+        assert_eq!(
+            config
+                .get("dns")
+                .and_then(Value::as_mapping)
+                .and_then(|dns| dns.get("enhanced-mode"))
+                .and_then(Value::as_str),
+            Some("redir-host")
+        );
+    }
+
+    #[test]
+    fn app_routing_keeps_existing_real_dns_mode() {
+        let mut dns = Mapping::new();
+        dns.insert(Value::from("enhanced-mode"), Value::from("redir-host"));
+        let mut config = Mapping::new();
+        config.insert(Value::from("dns"), Value::Mapping(dns));
+        let app_rule = IAppRoutingRule {
+            enabled: Some(true),
+            matcher: Some("process-path".into()),
+            value: Some("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into()),
+            policy: Some("Proxy".into()),
+            ..IAppRoutingRule::default()
+        };
+
+        let (config, _) = apply_app_routing_rules(config, Some(routing(vec![app_rule])));
+        assert_eq!(
+            config
+                .get("dns")
+                .and_then(Value::as_mapping)
+                .and_then(|dns| dns.get("enhanced-mode"))
+                .and_then(Value::as_str),
+            Some("redir-host")
+        );
+    }
+}
+
 /// Enhance mode
 /// 返回最终订阅、该订阅包含的键、和script执行的结果
 pub async fn enhance() -> Result<(Mapping, HashSet<String>, HashMap<String, ResultLog>)> {
@@ -725,6 +1089,7 @@ pub async fn enhance() -> Result<(Mapping, HashSet<String>, HashMap<String, Resu
         http_enabled,
         enable_dns_settings,
         enable_external_controller,
+        app_routing,
         #[cfg(not(target_os = "windows"))]
         redir_enabled,
         #[cfg(target_os = "linux")]
@@ -787,6 +1152,7 @@ pub async fn enhance() -> Result<(Mapping, HashSet<String>, HashMap<String, Resu
 
     // 手动覆盖后恢复 app 权威字段。
     let config = authoritative.enforce(config);
+    let (config, app_routing_applied) = apply_app_routing_rules(config, app_routing);
     let config = ensure_lan_bind_address(config);
 
     let config = cleanup_proxy_groups(config);
@@ -794,6 +1160,10 @@ pub async fn enhance() -> Result<(Mapping, HashSet<String>, HashMap<String, Resu
 
     let mut exists_keys_set = HashSet::new();
     exists_keys_set.extend(exists_keys);
+    if app_routing_applied {
+        exists_keys_set.insert("rules".into());
+        exists_keys_set.insert("find-process-mode".into());
+    }
 
     Ok((config, exists_keys_set, result_map))
 }

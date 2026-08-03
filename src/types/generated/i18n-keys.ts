@@ -115,6 +115,7 @@ export const translationKeys = [
   'layout.components.navigation.tabs.proxies',
   'layout.components.navigation.tabs.profiles',
   'layout.components.navigation.tabs.connections',
+  'layout.components.navigation.tabs.appRouting',
   'layout.components.navigation.tabs.rules',
   'layout.components.navigation.tabs.logs',
   'layout.components.navigation.tabs.unlock',

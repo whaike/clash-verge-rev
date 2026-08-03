@@ -108,6 +108,7 @@ fn determine_update_flags(patch: &IVerge) -> UpdateFlags {
     let home_cards = patch.home_cards.as_ref();
     let enable_auto_light_weight = patch.enable_auto_light_weight_mode;
     let enable_external_controller = patch.enable_external_controller;
+    let app_routing = &patch.app_routing;
     let tray_proxy_groups_display_mode = &patch.tray_proxy_groups_display_mode;
     let tray_inline_outbound_modes = patch.tray_inline_outbound_modes;
     let enable_proxy_guard = patch.enable_proxy_guard;
@@ -146,6 +147,9 @@ fn determine_update_flags(patch: &IVerge) -> UpdateFlags {
     }
     if tun_mode.is_some() {
         update_flags.insert(UpdateFlags::CLASH_CONFIG | UpdateFlags::GROUP_SYS_TRAY);
+    }
+    if app_routing.is_some() {
+        update_flags.insert(UpdateFlags::CLASH_CONFIG);
     }
     if enable_global_hotkey.is_some() || home_cards.is_some() {
         update_flags.insert(UpdateFlags::VERGE_CONFIG);
@@ -296,4 +300,20 @@ pub async fn fetch_verge_config() -> Result<SharedDraft<IVerge>> {
     let draft = Config::verge().await;
     let data = draft.data_arc();
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UpdateFlags, determine_update_flags};
+    use crate::config::{IAppRouting, IVerge};
+
+    #[test]
+    fn app_routing_change_reloads_the_core_config() {
+        let flags = determine_update_flags(&IVerge {
+            app_routing: Some(IAppRouting::default()),
+            ..IVerge::default()
+        });
+
+        assert!(flags.contains(UpdateFlags::CLASH_CONFIG));
+    }
 }
