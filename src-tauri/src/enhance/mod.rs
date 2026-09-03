@@ -748,6 +748,24 @@ fn app_routing_rule_to_yaml(rule: &IAppRoutingRule) -> Option<Value> {
     Some(Value::from(format!("{matcher},{value},{policy}")))
 }
 
+fn app_routing_stable_process_rule(rule: &IAppRoutingRule) -> Option<Value> {
+    if !rule.enabled.unwrap_or(true) || normalize_app_routing_matcher(rule.matcher.as_deref()) != "PROCESS-PATH" {
+        return None;
+    }
+
+    let value = rule.value.as_deref()?.trim();
+    let policy = rule.policy.as_deref()?.trim();
+    let helper_path = value.split("/Helpers/").nth(1)?;
+    if !value.contains(".app/Contents/Frameworks/") || !value.contains("/Versions/") {
+        return None;
+    }
+    let process_name = helper_path.rsplit('/').next()?;
+    if process_name.is_empty() || policy.is_empty() {
+        return None;
+    }
+    Some(Value::from(format!("PROCESS-NAME,{process_name},{policy}")))
+}
+
 fn app_routing_address_rules_to_yaml(rule: &IAppRoutingRule) -> Sequence {
     if !rule.enabled.unwrap_or(true) || !matches!(rule.address_policy.as_deref(), Some("cn-direct")) {
         return Sequence::new();
@@ -824,6 +842,7 @@ fn apply_app_routing_rules(mut config: Mapping, app_routing: Option<IAppRouting>
         .iter()
         .flat_map(app_routing_address_rules_to_yaml)
         .collect::<Sequence>();
+    generated_rules.extend(app_rules.iter().filter_map(app_routing_stable_process_rule));
     generated_rules.extend(app_rules.iter().filter_map(app_routing_rule_to_yaml));
     generated_rules.extend(app_routing_smart_rules_to_yaml(&app_routing));
 
@@ -926,6 +945,30 @@ mod app_routing_tests {
                 .and_then(|rules| rules.first())
                 .and_then(Value::as_str),
             Some("MATCH,DIRECT")
+        );
+    }
+
+    #[test]
+    fn app_routing_adds_stable_name_for_versioned_macos_helper_path() {
+        let path = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/151.0.7922.173/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper";
+        let (config, _) = apply_app_routing_rules(
+            Mapping::new(),
+            Some(routing(vec![IAppRoutingRule {
+                matcher: Some("process-path".into()),
+                value: Some(path.into()),
+                policy: Some("Proxy".into()),
+                ..IAppRoutingRule::default()
+            }])),
+        );
+        let rules = config.get("rules").and_then(Value::as_sequence).expect("rules");
+        assert_eq!(
+            rules.first().and_then(Value::as_str),
+            Some("PROCESS-NAME,Google Chrome Helper,Proxy")
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.as_str().is_some_and(|rule| rule.starts_with("PROCESS-PATH,")))
         );
     }
 
